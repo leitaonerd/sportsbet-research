@@ -1,0 +1,27 @@
+# ==== Python ====
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ==== Banco de dados ====
+# Arquivo do banco SQLite legado (se ainda existir)
+*.db
+*.sqlite
+*.sqlite3
+
+# ==== Credenciais / segredos ====
+# O .env real contém senha e nao deve ser versionado.
+.env
+!.env.example
+
+# ==== Ambientes virtuais ====
+.venv/
+venv/
+env/
+
+# ==== Editor / SO ====
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
