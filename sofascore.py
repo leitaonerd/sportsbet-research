@@ -286,7 +286,6 @@ class Database:
     def _insert_many(self, sql: str, rows: List[tuple]) -> int:
         """Insere em lote (executemany) num unico commit por entidade.
 
-
         Usa INSERT IGNORE para permanecer idempotente: re-executar o scraper nao
         duplica linhas ja gravadas (ex.: uma partida reprocessada).
         """
