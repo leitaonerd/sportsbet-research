@@ -1,7 +1,7 @@
 """
 Scraper do Brasileirão (Sofascore) -- Engenharia reversa da API interna.
 
-Implementa o fluxo completo descrito em webscrapping.md:
+Implementa o fluxo completo descrito em sofascore_workflow_brasileirao.md:
     Fase 1: Descoberta de IDs (temporadas do torneio 325 / Série A).
     Fase 2: Coleta de eventos (partidas) por rodada (1 a 38).
     Fase 3: Extração de detalhes (escalações e incidentes) por partida.
@@ -9,8 +9,8 @@ Implementa o fluxo completo descrito em webscrapping.md:
              carga: 1.Times 2.Jogadores 3.Partidas 4.Escalações 5.Incidentes.
     Seção 5: Headers miméticos, delays randomicos e retentativas contra 403/429.
 
-Requisitos: pip install requests
-Dependência de banco: sqlite3 (stdlib) -- nenhum ORM, rotinas SQL puras.
+Requisitos: pip install curl_cffi mysql-connector-python
+Dependência de banco: MySQL -- nenhum ORM, rotinas SQL puras.
 """
 
 import random
@@ -18,7 +18,8 @@ import time
 from typing import Any, Dict, List, Optional
 
 import mysql.connector
-import requests
+from curl_cffi import requests
+from curl_cffi.requests.errors import RequestsError
 
 import config
 
@@ -28,18 +29,13 @@ TOURNAMENT_ID = 325
 TOTAL_ROUNDS = 38
 
 # -------------------------------------------------- Headers miméticos (Seção 5)
+# Com curl_cffi, mantemos apenas headers de contexto da aplicação.
+# User-Agent e headers de segurança (Sec-Fetch) são injetados pelo 'impersonate'.
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    ),
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
     "Origin": "https://www.sofascore.com",
     "Referer": "https://www.sofascore.com/",
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "same-site",
 }
 
 # Intervalos de delay (segundos) conforme Seção 5 do plano.
@@ -59,7 +55,13 @@ def fetch_json(url: str, delay_range: tuple = DELAY_DETAILS) -> Optional[dict]:
     """
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+            # O parâmetro impersonate é a chave para burlar o bloqueio TLS
+            resp = requests.get(
+                url,
+                headers=HEADERS,
+                timeout=REQUEST_TIMEOUT,
+                impersonate="chrome120"
+            )
 
             if resp.status_code == 200:
                 time.sleep(random.uniform(*delay_range))
@@ -83,7 +85,7 @@ def fetch_json(url: str, delay_range: tuple = DELAY_DETAILS) -> Optional[dict]:
             print(f"  [HTTP {resp.status_code}] Falha em {url}.")
             return None
 
-        except requests.RequestException as exc:
+        except RequestsError as exc:
             print(f"  [Erro de rede] {exc} em {url}.")
             time.sleep(random.uniform(2, 4))
 
@@ -142,18 +144,17 @@ def collect_event_ids(season_id: int, total_rounds: int = TOTAL_ROUNDS) -> List[
 
 
 # -------------------------------------------- Fase 3: Lineups e Incidentes
-def get_lineups(event_id: int) -> List[dict]:
-    """Consome /event/{event_id}/lineups (titulares, reservas, tática, comissão)."""
+def get_lineups(event_id: int) -> dict:
+    """Consome /event/{event_id}/lineups (agora retornando o dict completo)."""
     url = f"{BASE_URL}/event/{event_id}/lineups"
-    data = fetch_json(url, delay_range=DELAY_DETAILS)
-    return data.get("lineups", []) if data else []
-
+    return fetch_json(url, delay_range=DELAY_DETAILS) or {}
 
 def get_incidents(event_id: int) -> List[dict]:
     """Consome /event/{event_id}/incidents (cronologia com minutagem exata)."""
     url = f"{BASE_URL}/event/{event_id}/incidents"
     data = fetch_json(url, delay_range=DELAY_DETAILS)
     return data.get("incidents", []) if data else []
+
 # ---------------------------------------------------------- Seção 4: Persistência
 class Database:
     """Routines SQL puras (mysql-connector) seguindo a ordem estrita de carga:
@@ -162,12 +163,6 @@ class Database:
     Conecta ao servidor MySQL, cria o banco e as tabelas (configuracao via
     `.env`/config.py) caso ainda nao existam, e expoe metodos de insert em
     lote para cada entidade do modelo relacional.
-
-    Como o scraper fica mais lento (rate limiting) do que o banco, inserimos em
-    lote (executemany) com um unico commit por entidade para maximizar eficiencia.
-
-    Compatível com a "Seção 4" do plano: ordem estrita de carga e SQL puro
-    (sem ORM).
     """
 
     SCHEMA = """
@@ -284,11 +279,7 @@ class Database:
             ) from exc
 
     def _insert_many(self, sql: str, rows: List[tuple]) -> int:
-        """Insere em lote (executemany) num unico commit por entidade.
-
-        Usa INSERT IGNORE para permanecer idempotente: re-executar o scraper nao
-        duplica linhas ja gravadas (ex.: uma partida reprocessada).
-        """
+        """Insere em lote (executemany) num unico commit por entidade."""
         if not rows:
             return 0
         try:
@@ -384,13 +375,22 @@ def extract_season(season, db: Database) -> None:
             event["status"], event["start_timestamp"],
         ))
 
-        # --- Escalações
-        for lu in get_lineups(eid):
-            team_id = lu["teamId"]
-            formation = lu.get("formation")
-            for entry in lu.get("players", []):
+        # --- Escalações (Validado)
+        lineups_data = get_lineups(eid)
+        for side in ["home", "away"]:
+            team_data = lineups_data.get(side)
+            if not team_data:
+                continue
+
+            team_id = event[f"{side}_team_id"]
+            formation = team_data.get("formation")
+
+            for entry in team_data.get("players", []):
                 p = entry.get("player", {})
-                pid = p["id"]
+                pid = p.get("id")
+                if not pid:
+                    continue
+
                 players.setdefault(pid, {
                     "id": pid,
                     "name": p.get("name"),
@@ -406,13 +406,19 @@ def extract_season(season, db: Database) -> None:
                     formation,
                 ))
 
-        # --- Incidentes
+        # --- Incidentes (Validado e Filtrado)
         for inc in get_incidents(eid):
+            # Tenta pegar o ID oficial. Se não existir (ex: eventos "FT" ou "injuryTime"), ignora.
+            inc_id = inc.get("id")
+            if not inc_id:
+                continue
+
             pid = (inc.get("player") or {}).get("id")
             pin = (inc.get("playerIn") or {}).get("id")
             pout = (inc.get("playerOut") or {}).get("id")
-            for ref in (inc.get("player"), inc.get("playerIn"),
-                        inc.get("playerOut")):
+
+            # Registra jogadores envolvidos no incidente que talvez não estivessem na escalação inicial
+            for ref in (inc.get("player"), inc.get("playerIn"), inc.get("playerOut")):
                 if not ref or not ref.get("id"):
                     continue
                 rid = ref["id"]
@@ -423,8 +429,9 @@ def extract_season(season, db: Database) -> None:
                     "position": ref.get("position"),
                     "jersey_number": ref.get("jerseyNumber"),
                 })
+
             incident_rows.append((
-                inc["id"], eid,
+                inc_id, eid,
                 inc.get("time"), inc.get("addedTime"),
                 inc.get("incidentType"), inc.get("incidentClass"),
                 pid, pin, pout,
