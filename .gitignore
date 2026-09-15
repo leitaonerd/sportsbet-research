@@ -23,5 +23,16 @@ env/
 # ==== Editor / SO ====
 .vscode/
 .idea/
+
+# ==== Dados ====
+# Artefatos derivados sao 100% regeneraveis a partir de BRA.csv:
+#   python src/data_loader.py && python src/features.py
+data/processed/
+# Copia do BRA.csv apenas para abrir no Excel — nao versionar duplicado
+BRA.xlsx
+
+# ==== Logs temporarios ====
+*.log
+
 .DS_Store
 Thumbs.db
